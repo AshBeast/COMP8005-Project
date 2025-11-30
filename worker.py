@@ -1,3 +1,19 @@
+"""
+Distributed password-cracking worker.
+
+- Connects to the central server and sends REGISTER.
+- Receives hash target and WORK assignments: disjoint integer ranges [start, end).
+- Converts each index into a candidate password (variable length, 79-char charset).
+- Verifies candidate passwords against many hash formats:
+    * Raw hashes: md5:, sha256:, sha512:
+    * crypt(3) hashes: $1$ (MD5-crypt), $5$ (SHA256-crypt), $6$ (SHA512-crypt)
+    * Optional: bcrypt ($2a$/$2b$/$2y$) and yescrypt ($y$) if libraries installed
+- Multithreaded cracking: splits each WORK range into sub-ranges for worker threads.
+- Sends CHECKPOINT messages (progress) and DONE messages (completed range).
+- Sends FOUND immediately when password is discovered.
+- Sends periodic PING heartbeats so the server does not mark it as LOST.
+"""
+
 #!/usr/bin/env python3
 import argparse
 import socket
@@ -6,6 +22,19 @@ import threading
 import time
 import subprocess
 from typing import Tuple, Optional
+import hashlib
+
+# ---------------- optional heavy-hash libraries ----------------
+try:
+    import bcrypt      # $2a$, $2b$, $2y$
+except Exception:
+    bcrypt = None
+
+try:
+    import yescrypt    # $y$ (Linux shadow yescrypt)
+except Exception:
+    yescrypt = None
+
 
 # ---------------- protocol helpers ----------------
 
@@ -19,14 +48,11 @@ def parse_work_line(line: str) -> Tuple[int, int, int]:
     parts = line.split()
     if len(parts) < 2 or parts[0] != "WORK":
         raise ValueError(f"Not a WORK line: {line!r}")
-
     params = {}
     for part in parts[1:]:
-        if "=" not in part:
-            continue
-        key, value = part.split("=", 1)
-        params[key] = int(value)
-
+        if "=" in part:
+            k, v = part.split("=", 1)
+            params[k] = int(v)
     return params["start"], params["end"], params["checkpoint"]
 
 def safe_send(sock: socket.socket, data: str, send_lock: threading.Lock) -> bool:
@@ -38,31 +64,70 @@ def safe_send(sock: socket.socket, data: str, send_lock: threading.Lock) -> bool
         return False
 
 
-# ---------------- hash verify ----------------
-# Prefer stdlib `crypt` if available (fast, no subprocess). Fallback to openssl.
+# ---------------- hash verify (MODIFIED) ----------------
 
 try:
-    import crypt  # type: ignore
+    import crypt  # system crypt(3)
 except Exception:
     crypt = None
 
+
 def verify_candidate(candidate: str, target_hash: str) -> bool:
+    """
+    Order of checking:
+      1. Raw hashes (sha256:, sha512:, md5:)
+      2. bcrypt ($2a$, $2b$, $2y$)
+      3. yescrypt ($y$)
+      4. crypt(3) hashes ($1$, $5$, $6$)
+      5. openssl fallback for crypt-style hashes
+    """
+
+    # ---------- raw SHA-256 ----------
+    if target_hash.startswith("sha256:"):
+        h = hashlib.sha256(candidate.encode()).hexdigest()
+        return h == target_hash.split("sha256:", 1)[1]
+
+    # ---------- raw SHA-512 ----------
+    if target_hash.startswith("sha512:"):
+        h = hashlib.sha512(candidate.encode()).hexdigest()
+        return h == target_hash.split("sha512:", 1)[1]
+
+    # ---------- raw MD5 ----------
+    if target_hash.startswith("md5:"):
+        h = hashlib.md5(candidate.encode()).hexdigest()
+        return h == target_hash.split("md5:", 1)[1]
+
+    # ---------- bcrypt ----------
+    if target_hash.startswith("$2") and bcrypt is not None:
+        try:
+            return bcrypt.checkpw(candidate.encode(), target_hash.encode())
+        except Exception:
+            pass
+
+    # ---------- yescrypt ----------
+    if target_hash.startswith("$y$") and yescrypt is not None:
+        try:
+            return yescrypt.verify(candidate, target_hash)
+        except Exception:
+            pass
+
+    # ---------- crypt(3) if available ----------
     if crypt is not None:
         try:
             return crypt.crypt(candidate, target_hash) == target_hash
         except Exception:
             pass
+
+    # ---------- OpenSSL fallback for $1/$5/$6 ----------
     return openssl_verify(candidate, target_hash)
+
 
 def openssl_verify(candidate: str, full_hash: str) -> bool:
     computed = openssl_crypt(candidate, full_hash)
     return computed == full_hash
 
 def openssl_crypt(candidate: str, full_hash: str) -> Optional[str]:
-    """
-    Compute mkpasswd-style $1/$5/$6 crypt using openssl.
-    Tries both '-rounds X' and embedding rounds in salt.
-    """
+    """Compute mkpasswd-style $1/$5/$6 crypt using openssl."""
     if not full_hash.startswith("$"):
         return None
 
@@ -70,7 +135,7 @@ def openssl_crypt(candidate: str, full_hash: str) -> Optional[str]:
     if len(parts) < 3:
         return None
 
-    algo = parts[1]       # "1" md5, "5" sha256, "6" sha512
+    algo = parts[1]     # "1", "5", "6"
     salt = parts[2]
     rounds = None
 
@@ -83,17 +148,17 @@ def openssl_crypt(candidate: str, full_hash: str) -> Optional[str]:
     base_cmd = ["openssl", "passwd", flag, "-salt", salt]
 
     if rounds is not None:
-        try_cmd = base_cmd + ["-rounds", rounds, candidate]
         try:
-            out = subprocess.check_output(try_cmd, stderr=subprocess.DEVNULL)
+            out = subprocess.check_output(base_cmd + ["-rounds", rounds, candidate],
+                                          stderr=subprocess.DEVNULL)
             return out.decode().strip()
         except Exception:
             pass
 
-        embedded_salt = f"rounds={rounds}${salt}"
-        try_cmd2 = ["openssl", "passwd", flag, "-salt", embedded_salt, candidate]
+        embedded = f"rounds={rounds}${salt}"
         try:
-            out = subprocess.check_output(try_cmd2, stderr=subprocess.DEVNULL)
+            out = subprocess.check_output(["openssl", "passwd", flag, "-salt", embedded, candidate],
+                                          stderr=subprocess.DEVNULL)
             return out.decode().strip()
         except Exception:
             return None
@@ -124,10 +189,6 @@ def total_space_size() -> int:
     return total
 
 def index_to_word(idx: int) -> Optional[str]:
-    """
-    Map 0..(total_space-1) into strings over CHARSET.
-    Ordering: all length=1 then length=2 then length=3 and so on until we find the password.
-    """
     base = len(CHARSET)
     for L in range(MIN_LEN, MAX_LEN + 1):
         count = base ** L
@@ -144,7 +205,6 @@ def index_to_word(idx: int) -> Optional[str]:
 
 # ---------------- threaded cracking ----------------
 
-# initial CHECKPOINT (attempts=0) so the server sees activity even when checkpoint == work_size
 def crack_range_threaded(
     sock: socket.socket,
     node_id: int,
@@ -155,13 +215,7 @@ def crack_range_threaded(
     num_threads: int,
     send_lock: threading.Lock,
 ) -> Tuple[int, Optional[str]]:
-    """
-    Returns (attempts_done, found_password).
-    Sends:
-      - CHECKPOINT at start of chunk (attempts=0) so checkpoint==worksize still shows activity.
-      - CHECKPOINT every N attempts (best-effort).
-      - FOUND when discovered.
-    """
+
     keyspace_total = total_space_size()
     total_assigned = end - start
     if total_assigned <= 0:
@@ -174,7 +228,6 @@ def crack_range_threaded(
     attempts = 0
     next_checkpoint = checkpoint if checkpoint > 0 else None
 
-    # initial checkpoint (Darcy's "checkpoint==worksize" edge case)
     safe_send(
         sock,
         f"CHECKPOINT node={node_id} current={start-1} attempts=0 total={total_assigned}\n",
@@ -215,11 +268,10 @@ def crack_range_threaded(
                 attempts += 1
                 maybe_checkpoint(current_idx)
 
-    # split [start, end) into contiguous parts (no overlaps)
     total = end - start
     if num_threads < 1:
         num_threads = 1
-    span = (total + num_threads - 1) // num_threads  # ceil
+    span = (total + num_threads - 1) // num_threads
     threads = []
     for i in range(num_threads):
         a = start + i * span
@@ -268,7 +320,6 @@ def run_worker(server_ip: str, port: int, num_threads: int, ping_interval: float
         print(f"[WORKER] Target hash received.")
         print(f"[WORKER] Bruteforce lengths {MIN_LEN}..{MAX_LEN}, charset={len(CHARSET)}, keyspace={total_space_size()}")
 
-        # Heartbeat: periodic PING so the server watchdog doesn't mark this worker LOST
         hb_stop = threading.Event()
         def heartbeat():
             while not hb_stop.is_set():
@@ -332,7 +383,6 @@ def main():
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--ping-interval", type=float, default=1.0)
     args = parser.parse_args()
-
     run_worker(args.server, args.port, args.threads, args.ping_interval)
 
 if __name__ == "__main__":
