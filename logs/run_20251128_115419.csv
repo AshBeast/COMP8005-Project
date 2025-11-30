@@ -1,0 +1,7 @@
+ts_iso,event,node_id,range_start,range_end,cursor,attempts,total,password,note
+2025-11-28T11:54:21,REGISTER,1,,,,,,,192.168.0.44:41286
+2025-11-28T11:54:21,ASSIGN,1,0,10000,,,10000,,
+2025-11-28T11:54:21,CHECKPOINT,1,0,10000,-1,0,10000,,
+2025-11-28T11:54:25,LOST,1,,,,,,,disconnect
+2025-11-28T11:54:25,REQUEUE,1,0,10000,,,,,resume_start=0
+2025-11-28T11:54:27,SERVER_STOP,,,,,,,,
